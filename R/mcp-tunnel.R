@@ -25,6 +25,15 @@ McpConnection <- R6::R6Class(
       # Marks sessions created over the MCP tunnel (see isMcpSession()), so
       # e.g. processDeps() can inline dynamic dependencies for the sandbox.
       req$HTTP_MCP_TUNNEL <- "1"
+      # Hosted deployments (Posit Connect, Shiny Server Pro) start Shiny
+      # with a shared secret and wsHandler() closes any connection whose
+      # request lacks it. The tunnel is server-internal, so present the
+      # secret the same way a proxied browser websocket would.
+      secret <- getOption("shiny.sharedSecret")
+      if (is.raw(secret)) secret <- rawToChar(secret)
+      if (is.character(secret) && length(secret) > 0 && nzchar(secret[[1]])) {
+        req$HTTP_SHINY_SHARED_SECRET <- secret[[1]]
+      }
       self$request <- req
     },
 
