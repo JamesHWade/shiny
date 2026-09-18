@@ -63,6 +63,10 @@ mcpFakePageRequest <- function() {
   req$PATH_INFO <- "/"
   req$QUERY_STRING <- ""
   req$HTTP_HOST <- "127.0.0.1"
+  # Lets a `ui(request)` function tell that it is rendering the MCP App
+  # resource (for example to choose a layout that fits a host's card) rather
+  # than serving a browser page.
+  req$HTTP_MCP_APP <- "1"
   req
 }
 
