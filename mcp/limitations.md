@@ -43,6 +43,34 @@ static tool/resource `_meta`, not from the tool-call result. Dead end.
 `mcpUpdates()` channel and applied by the author with `updateXxxInput()`. A
 brief flash (default → model's value) on open is unavoidable.
 
+### Update, 2026-09-28: solved on the client instead
+
+The restore doesn't have to happen on the server. The arguments reach the page
+before Shiny *needs* them: hosts send `ui/notifications/tool-input` right
+after the handshake, and the session can't start before the handshake anyway
+(the tunnel calls tools through the host). So the bridge now holds Shiny's
+initialization (new `Shiny.deferInitialization(promise)`) until the arguments
+arrive, at most one second after the handshake, and writes each declared
+argument into the markup of the input with the same id (a `<select>`'s
+selected options, a slider's `data-from`, a date input's
+`data-initial-date`, and so on). Shiny's own bindings then initialize from
+those values and send them with "init": the server function's first render
+uses the model's values, nothing is sent twice, and no author code is needed.
+See `srcts/src/mcp/applyArguments.ts` and `proposed-changes.md`.
+
+Two things we tried first, and why they fell short:
+
+- *Rewriting the "init" message in a `shiny:connected` handler* (after
+  setting each widget through its binding) gets the first render right, but
+  the widget's change event queues a resend that goes out after "init".
+  `session$input` is created with `dedupe = FALSE` (the client's
+  `InputNoResendDecorator` is meant to drop duplicates, and its cache was
+  filled from the defaults), so the server renders a second time. This is
+  still the fallback for inputs from packages, whose markup the bridge
+  doesn't know.
+- *Holding the socket open* until the arguments arrive has the same problem;
+  the inputs have already been bound and cached by then.
+
 ## 2. There is no in-place "update the running app" — hosts re-render per call
 
 The model's only lever on the app is calling a tool. When asked to change a

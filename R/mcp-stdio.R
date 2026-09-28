@@ -57,6 +57,8 @@ mcpStdioHandleLine <- function(line, dispatch, write) {
 }
 
 mcpStdioSerialize <- function(payload) {
+  # The HTTP status that stateless-protocol errors carry means nothing here.
+  attr(payload, "mcpHttpStatus") <- NULL
   as.character(jsonlite::toJSON(
     payload,
     auto_unbox = TRUE, null = "null", force = TRUE

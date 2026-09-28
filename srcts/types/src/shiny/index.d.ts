@@ -46,8 +46,18 @@ declare class ShinyClass {
     unbindAll?: typeof shinyUnbindAll;
     initializeInputs?: typeof shinyInitializeInputs;
     initializedPromise: InitStatusPromise<void>;
+    private initializationDeferrals;
     oncustommessage?: Handler;
     constructor();
+    /**
+     * Delays initialization until `promise` settles. For scripts that must
+     * change the page before Shiny reads its inputs: the MCP Apps bridge, for
+     * example, sets inputs from the arguments of the tool call that opened the
+     * app, which arrive from the host asynchronously. Call it before the
+     * document is ready.
+     * @param promise A promise; its result and any error are ignored.
+     */
+    deferInitialization(promise: Promise<unknown>): void;
     /**
      * Method to check if Shiny is running in development mode. By packaging as a
      * method, we can we can avoid needing to look for the `__SHINY_DEV_MODE__`

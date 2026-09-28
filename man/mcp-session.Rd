@@ -64,13 +64,14 @@ and can exchange information with the host:
 through an MCP host (as opposed to a regular browser).
 \item \code{mcpUpdates()} returns the arguments the model supplied when it opened
 the app (a reactive read), filtered to the arguments declared with
-\code{mcpConfigure(arguments = list(...))}. Apply them from a single
-\code{observe()} with the usual \code{updateXxxInput()} functions. Hosts render a
-fresh instance for each tool call, so the same observer handles both the
-initial open and any later re-open. When \code{arguments} are declared,
-an \verb{update_<appId>_app} tool is auto-registered; the model can call it
-to push new argument values to a running instance (server-side), which
-also arrive through this same \code{mcpUpdates()} channel.
+\code{mcpConfigure(arguments = list(...))}. An argument named after an input
+sets that input on its own, before the app's first render; use
+\code{mcpUpdates()} for arguments that aren't inputs. Hosts render a fresh
+instance for each tool call, so the same code handles both the initial
+open and any later re-open. When \code{arguments} are declared, an
+\verb{update_<appId>_app} tool is auto-registered; the model can call it to
+push new argument values to a running instance. They set same-named
+inputs too, and also arrive through this same \code{mcpUpdates()} channel.
 \item \code{mcpHostContext()} returns the host's context (theme, locale, display
 mode, ...) as a named list (reactive read).
 \item \code{mcpUpdateModelContext()} updates the model's context for future
@@ -127,16 +128,20 @@ as MCP tools the model may call directly, with \code{\link[=registerMcpTool]{reg
 mcpConfigure(
   appId = "sales",
   description = "Show the interactive sales dashboard.",
-  arguments = list(region = ellmer::type_string("Region to focus on"))
+  # `region` sets the input of the same name; `highlight` isn't an input
+  arguments = list(
+    region = ellmer::type_string("Region to focus on"),
+    highlight = ellmer::type_string("Product line to highlight", required = FALSE)
+  )
 )
 
 server <- function(input, output, session) {
-  # Post-open updates from the model
+  output$trend <- renderPlot(
+    plot_sales(input$region, highlight = mcpUpdates()$highlight)
+  )
   observe({
-    region <- mcpUpdates()$region
-    if (!is.null(region)) updateSelectInput(session, "region", selected = region)
+    mcpUpdateModelContext(text = paste("Viewing", input$region))
   })
-  mcpUpdateModelContext(text = paste("Viewing", input$region))
 }
 }
 

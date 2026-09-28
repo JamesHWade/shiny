@@ -4,6 +4,7 @@ import { renderContent } from "../shiny/render";
 import { windowDevicePixelRatio } from "../window/pixelRatio";
 import type { MapValuesUnion, MapWithResult } from "./extraTypes";
 import { asArray, hasDefinedProperty, hasOwnProperty } from "./object";
+import { compileSafeExpression, isEvalRefused } from "./safeExpression";
 
 function escapeHTML(str: string): string {
   /* eslint-disable @typescript-eslint/naming-convention */
@@ -200,12 +201,45 @@ function scopeExprToFunc(expr: string): (scope: unknown) => unknown {
       }`,
     );
   } catch (e) {
+    // A Content Security Policy without 'unsafe-eval' (MCP Apps hosts use
+    // one) refuses new Function(); read the expression without it.
+    if (isEvalRefused(e)) {
+      return scopeExprToSafeFunc(expr);
+    }
     console.error("Error parsing expression: " + expr);
     throw e;
   }
 
   return function (scope: unknown): unknown {
     return func.call(scope);
+  };
+}
+
+// scopeExprToFunc() for pages that can't evaluate strings as code. An
+// expression the interpreter can't read is treated as true (its panel
+// shows), with a warning; one that fails while evaluating is false.
+function scopeExprToSafeFunc(expr: string): (scope: unknown) => unknown {
+  let compiled: (scope: unknown) => unknown;
+  try {
+    compiled = compileSafeExpression(expr);
+  } catch (e) {
+    console.warn(
+      "This page's Content Security Policy doesn't allow evaluating the " +
+        "expression '" +
+        expr +
+        "', and Shiny can't read it without that (" +
+        (e as Error).message +
+        "). Treating it as true.",
+    );
+    return () => true;
+  }
+  return function (scope: unknown): unknown {
+    try {
+      return compiled(scope);
+    } catch (e) {
+      console.error("Error evaluating expression: " + expr, e);
+      return false;
+    }
   };
 }
 

@@ -820,6 +820,347 @@
     return window.devicePixelRatio;
   }
 
+  // srcts/src/utils/safeExpression.ts
+  var allowedMethods = [
+    "indexOf",
+    "lastIndexOf",
+    "includes",
+    "join",
+    "concat",
+    "slice",
+    "toLowerCase",
+    "toUpperCase",
+    "trim",
+    "startsWith",
+    "endsWith",
+    "charAt",
+    "substring",
+    "substr",
+    "toString",
+    "test",
+    "match"
+  ];
+  var punctuation = [
+    "===",
+    "!==",
+    "==",
+    "!=",
+    "<=",
+    ">=",
+    "&&",
+    "||",
+    "<",
+    ">",
+    "!",
+    "(",
+    ")",
+    "[",
+    "]",
+    ".",
+    ",",
+    "+",
+    "-",
+    "*",
+    "/",
+    "%",
+    "?",
+    ":"
+  ];
+  var literals = {
+    true: true,
+    false: false,
+    null: null,
+    undefined: void 0
+  };
+  var hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
+  function afterOperand(tokens) {
+    const last = tokens[tokens.length - 1];
+    if (!last) return false;
+    if (last.type === "value") return true;
+    if (last.type === "name") return last.value !== "typeof";
+    return last.value === ")" || last.value === "]";
+  }
+  function tokenize(src) {
+    const tokens = [];
+    let i5 = 0;
+    while (i5 < src.length) {
+      const c4 = src.charAt(i5);
+      const rest = src.slice(i5);
+      let m2;
+      if (/\s/.test(c4)) {
+        i5++;
+      } else if (c4 === "/" && !afterOperand(tokens)) {
+        let end = i5 + 1;
+        let inClass = false;
+        while (end < src.length && (inClass || src.charAt(end) !== "/")) {
+          const ch = src.charAt(end);
+          if (ch === "\\") end++;
+          else if (ch === "[") inClass = true;
+          else if (ch === "]") inClass = false;
+          end++;
+        }
+        if (end >= src.length) throw new Error("unterminated regular expression");
+        const flags = /^[gimsuy]*/.exec(src.slice(end + 1))[0];
+        tokens.push({
+          type: "value",
+          value: new RegExp(src.slice(i5 + 1, end), flags)
+        });
+        i5 = end + 1 + flags.length;
+      } else if (m2 = /^(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][-+]?[0-9]+)?/.exec(rest)) {
+        tokens.push({ type: "value", value: parseFloat(m2[0]) });
+        i5 += m2[0].length;
+      } else if (c4 === "'" || c4 === '"') {
+        let j2 = i5 + 1;
+        let text = "";
+        while (j2 < src.length && src.charAt(j2) !== c4) {
+          if (src.charAt(j2) === "\\") {
+            j2++;
+            const e4 = src.charAt(j2);
+            text += e4 === "n" ? "\n" : e4 === "t" ? "	" : e4;
+          } else {
+            text += src.charAt(j2);
+          }
+          j2++;
+        }
+        if (j2 >= src.length) throw new Error("unterminated string");
+        tokens.push({ type: "value", value: text });
+        i5 = j2 + 1;
+      } else if (m2 = /^[A-Za-z_$][A-Za-z0-9_$]*/.exec(rest)) {
+        tokens.push({ type: "name", value: m2[0] });
+        i5 += m2[0].length;
+      } else {
+        const op = punctuation.find((p3) => rest.startsWith(p3));
+        if (!op) throw new Error("unexpected '" + c4 + "'");
+        tokens.push({ type: "op", value: op });
+        i5 += op.length;
+      }
+    }
+    return tokens;
+  }
+  var precedence = [
+    ["||"],
+    ["&&"],
+    ["==", "!=", "===", "!=="],
+    ["<", "<=", ">", ">="],
+    ["+", "-"],
+    ["*", "/", "%"]
+  ];
+  function parse(src) {
+    const tokens = tokenize(src);
+    let pos = 0;
+    const isOp = (value) => {
+      const t3 = tokens[pos];
+      return !!t3 && t3.type === "op" && t3.value === value;
+    };
+    const expect = (value) => {
+      if (!isOp(value)) throw new Error("expected '" + value + "'");
+      pos++;
+    };
+    const list = (close) => {
+      const items = [];
+      if (!isOp(close)) {
+        items.push(conditional());
+        while (isOp(",")) {
+          pos++;
+          items.push(conditional());
+        }
+      }
+      expect(close);
+      return items;
+    };
+    function conditional() {
+      const test = binary(0);
+      if (!isOp("?")) return test;
+      pos++;
+      const yes = conditional();
+      expect(":");
+      return { node: "if", test, yes, no: conditional() };
+    }
+    function binary(level) {
+      if (level === precedence.length) return unary();
+      let left = binary(level + 1);
+      for (; ; ) {
+        const t3 = tokens[pos];
+        if (!t3 || t3.type !== "op" || !precedence[level].includes(t3.value)) break;
+        pos++;
+        const right = binary(level + 1);
+        left = level < 2 ? { node: "logical", op: t3.value, left, right } : { node: "binary", op: t3.value, left, right };
+      }
+      return left;
+    }
+    function unary() {
+      const t3 = tokens[pos];
+      if (t3 && (t3.type === "op" && (t3.value === "!" || t3.value === "-" || t3.value === "+") || t3.type === "name" && t3.value === "typeof")) {
+        pos++;
+        return { node: "unary", op: t3.value, arg: unary() };
+      }
+      return postfix();
+    }
+    function postfix() {
+      let node = primary();
+      for (; ; ) {
+        if (isOp(".")) {
+          pos++;
+          const name = tokens[pos++];
+          if (!name || name.type !== "name") {
+            throw new Error("expected a name after '.'");
+          }
+          node = {
+            node: "member",
+            object: node,
+            key: { node: "value", value: name.value }
+          };
+        } else if (isOp("[")) {
+          pos++;
+          const key = conditional();
+          expect("]");
+          node = { node: "member", object: node, key };
+        } else if (isOp("(")) {
+          if (node.node !== "member")
+            throw new Error("only methods can be called");
+          pos++;
+          node = {
+            node: "call",
+            object: node.object,
+            key: node.key,
+            args: list(")")
+          };
+        } else {
+          return node;
+        }
+      }
+    }
+    function primary() {
+      const t3 = tokens[pos++];
+      if (!t3) throw new Error("unexpected end");
+      if (t3.type === "value") return { node: "value", value: t3.value };
+      if (t3.type === "name") {
+        if (hasOwn(literals, t3.value))
+          return { node: "value", value: literals[t3.value] };
+        return { node: "name", name: t3.value };
+      }
+      if (t3.value === "(") {
+        const inner = conditional();
+        expect(")");
+        return inner;
+      }
+      if (t3.value === "[") return { node: "array", items: list("]") };
+      throw new Error("unexpected '" + t3.value + "'");
+    }
+    const tree = conditional();
+    if (pos < tokens.length) {
+      throw new Error("unexpected '" + String(tokens[pos].value) + "'");
+    }
+    return tree;
+  }
+  function readMember(object, key) {
+    if (object === null || object === void 0) {
+      throw new TypeError(
+        "can't read '" + String(key) + "' of " + String(object)
+      );
+    }
+    if (typeof object === "string" || Array.isArray(object)) {
+      const indexable = object;
+      if (key === "length") return indexable.length;
+      if (typeof key === "number") return indexable[key];
+      return void 0;
+    }
+    if (typeof object === "object" && hasOwn(object, key)) {
+      return object[key];
+    }
+    return void 0;
+  }
+  function binaryOp(op, a3, b3) {
+    switch (op) {
+      case "==":
+        return a3 == b3;
+      case "!=":
+        return a3 != b3;
+      case "===":
+        return a3 === b3;
+      case "!==":
+        return a3 !== b3;
+      case "<":
+        return a3 < b3;
+      case "<=":
+        return a3 <= b3;
+      case ">":
+        return a3 > b3;
+      case ">=":
+        return a3 >= b3;
+      case "+":
+        return a3 + b3;
+      case "-":
+        return a3 - b3;
+      case "*":
+        return a3 * b3;
+      case "/":
+        return a3 / b3;
+      default:
+        return a3 % b3;
+    }
+  }
+  function evaluate(node, scope) {
+    switch (node.node) {
+      case "value":
+        return node.value;
+      case "name":
+        if (!hasOwn(scope, node.name))
+          throw new ReferenceError(node.name + " is not defined");
+        return scope[node.name];
+      case "array":
+        return node.items.map((item) => evaluate(item, scope));
+      case "member":
+        return readMember(
+          evaluate(node.object, scope),
+          evaluate(node.key, scope)
+        );
+      case "call": {
+        const target = evaluate(node.object, scope);
+        const method = evaluate(node.key, scope);
+        const allowed = typeof target === "string" || Array.isArray(target) || target instanceof RegExp;
+        if (!allowed || !allowedMethods.includes(method) || typeof target[method] !== "function") {
+          throw new TypeError("can't call " + String(method) + "()");
+        }
+        const args = node.args.map((arg) => evaluate(arg, scope));
+        return target[method].apply(
+          target,
+          args
+        );
+      }
+      case "unary": {
+        const a3 = evaluate(node.arg, scope);
+        if (node.op === "!") return !a3;
+        if (node.op === "-") return -a3;
+        if (node.op === "+") return +a3;
+        return typeof a3;
+      }
+      case "logical": {
+        const a3 = evaluate(node.left, scope);
+        if (node.op === "&&") return a3 ? evaluate(node.right, scope) : a3;
+        return a3 ? a3 : evaluate(node.right, scope);
+      }
+      case "binary":
+        return binaryOp(
+          node.op,
+          evaluate(node.left, scope),
+          evaluate(node.right, scope)
+        );
+      case "if":
+        return evaluate(node.test, scope) ? evaluate(node.yes, scope) : evaluate(node.no, scope);
+      default:
+        throw new Error("unknown expression");
+    }
+  }
+  function compileSafeExpression(expr) {
+    const tree = parse(expr);
+    return (scope) => evaluate(tree, scope ?? {});
+  }
+  function isEvalRefused(e4) {
+    if (typeof EvalError !== "undefined" && e4 instanceof EvalError) return true;
+    return /unsafe-eval|Content Security Policy/i.test(String(e4));
+  }
+
   // srcts/src/utils/index.ts
   function escapeHTML(str) {
     const escaped = {
@@ -931,11 +1272,33 @@
       }`
       );
     } catch (e4) {
+      if (isEvalRefused(e4)) {
+        return scopeExprToSafeFunc(expr);
+      }
       console.error("Error parsing expression: " + expr);
       throw e4;
     }
     return function(scope) {
       return func.call(scope);
+    };
+  }
+  function scopeExprToSafeFunc(expr) {
+    let compiled;
+    try {
+      compiled = compileSafeExpression(expr);
+    } catch (e4) {
+      console.warn(
+        "This page's Content Security Policy doesn't allow evaluating the expression '" + expr + "', and Shiny can't read it without that (" + e4.message + "). Treating it as true."
+      );
+      return () => true;
+    }
+    return function(scope) {
+      try {
+        return compiled(scope);
+      } catch (e4) {
+        console.error("Error evaluating expression: " + expr, e4);
+        return false;
+      }
     };
   }
   function mergeSort(list, sortfunc) {
@@ -7271,6 +7634,8 @@ ${duplicateIdMsg}`;
   // srcts/src/shiny/index.ts
   var ShinyClass = class {
     constructor() {
+      // Promises initialization waits for; see deferInitialization().
+      this.initializationDeferrals = [];
       this.version = "1.14.0.9000";
       const { inputBindings, fileInputBinding: fileInputBinding2 } = initInputBindings();
       const { outputBindings } = initOutputBindings();
@@ -7300,6 +7665,7 @@ ${duplicateIdMsg}`;
       (0, import_jquery40.default)(() => {
         setTimeout(async () => {
           try {
+            await Promise.allSettled(this.initializationDeferrals);
             await this.initialize();
           } catch (e4) {
             showErrorInClientConsole(e4);
@@ -7307,6 +7673,17 @@ ${duplicateIdMsg}`;
           }
         }, 1);
       });
+    }
+    /**
+     * Delays initialization until `promise` settles. For scripts that must
+     * change the page before Shiny reads its inputs: the MCP Apps bridge, for
+     * example, sets inputs from the arguments of the tool call that opened the
+     * app, which arrive from the host asynchronously. Call it before the
+     * document is ready.
+     * @param promise A promise; its result and any error are ignored.
+     */
+    deferInitialization(promise) {
+      this.initializationDeferrals.push(promise);
     }
     /**
      * Method to check if Shiny is running in development mode. By packaging as a

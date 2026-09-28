@@ -8,6 +8,7 @@ mcpConfigure(
   appId = NULL,
   description = NULL,
   arguments = NULL,
+  result = NULL,
   direct = TRUE,
   displayModes = c("inline", "fullscreen", "pip"),
   origin = NULL,
@@ -27,12 +28,21 @@ the model reads it to decide whether to open the app.}
 \item{arguments}{Optional named list of \pkg{ellmer} type objects (e.g.
 \code{\link[ellmer:type_integer]{ellmer::type_integer()}}) declaring the arguments the model may pass when
 opening the app. Published as the tool's input schema and used as an
-allow-list. Read within the app with \code{\link[=mcpUpdates]{mcpUpdates()}} and apply them from a
-single \code{observe()} with the usual \code{updateXxxInput()} functions; the host
-renders a fresh instance per tool call, so the same observer handles both
-the initial open and any later re-open. There is no input/bookmark
-auto-restore of init args (a brief flash from the widget default to the
-model's value on open is unavoidable); see \link{mcp-session}.}
+allow-list. An argument named after an input sets that input before the
+app's first render, so outputs are computed once, with the model's
+values. All arguments are also available within the app from
+\code{\link[=mcpUpdates]{mcpUpdates()}}, for anything that isn't an input; see \link{mcp-session}.}
+
+\item{result}{Optional function computing the result of the tool that
+opens the app, in place of the text "The Shiny app is now displayed in
+the conversation." It is called with the arguments the model passed
+(filtered by \code{arguments}), outside of any Shiny session, and may return
+a string (text for the model), a named list (structured content, also
+sent as JSON text), \code{NULL} (the default text), or a promise of one of
+these. Use it to tell the model what the app will show, such as the
+figures or record ids it should know about; hosts that can't display
+apps show the model nothing else. An error falls back to the default
+text, with a warning.}
 
 \item{direct}{Whether to advertise the direct-connect fast path (default
 \code{TRUE}).}

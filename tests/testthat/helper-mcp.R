@@ -20,12 +20,16 @@ fakeRookInput <- function(bytes) {
   list(read = function(...) bytes, rewind = function() NULL)
 }
 
-mcp_req <- function(body, method = "POST", path = "/mcp") {
+mcp_req <- function(body, method = "POST", path = "/mcp", headers = list()) {
   req <- new.env(parent = emptyenv())
   req$REQUEST_METHOD <- method
   req$PATH_INFO <- path
   req$QUERY_STRING <- ""
   req$HTTP_HOST <- "127.0.0.1"
+  for (name in names(headers)) {
+    key <- paste0("HTTP_", gsub("-", "_", toupper(name), fixed = TRUE))
+    assign(key, headers[[name]], envir = req)
+  }
   if (!is.null(body)) {
     json <- jsonlite::toJSON(body, auto_unbox = TRUE, null = "null")
     req$rook.input <- fakeRookInput(charToRaw(json))
@@ -75,4 +79,37 @@ pump_shiny <- function(seconds = 0.1) {
     flushPendingSessions()
     later::run_now(0.02)
   }
+}
+
+# A 2026-07-28 (stateless) request: version and client capabilities in
+# `_meta`, mirrored in headers the way HTTP clients send them.
+mcp_stateless_req <- function(method, params = list(), id = 1,
+                              version = "2026-07-28", ui = TRUE,
+                              headers = NULL) {
+  capabilities <- list()
+  if (ui) {
+    capabilities$extensions <- list(
+      "io.modelcontextprotocol/ui" = list(mimeTypes = list("text/html;profile=mcp-app"))
+    )
+  }
+  meta <- list(
+    "io.modelcontextprotocol/protocolVersion" = version,
+    "io.modelcontextprotocol/clientCapabilities" = capabilities
+  )
+  params$`_meta` <- meta
+  body <- list(jsonrpc = "2.0", id = id, method = method, params = params)
+  if (is.null(headers)) {
+    headers <- list("MCP-Protocol-Version" = version, "Mcp-Method" = method)
+    target <- params$name %||% params$uri
+    if (!is.null(target)) headers[["Mcp-Name"]] <- target
+  }
+  mcp_req(body, headers = headers)
+}
+
+mcp_response <- function(handler, req) {
+  resp <- wait_for_result(handler(req))
+  list(
+    status = resp$status,
+    body = jsonlite::parse_json(rawToChar(as_bytes(resp$content)))
+  )
 }

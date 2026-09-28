@@ -1,5 +1,27 @@
 # shiny (development version)
 
+* Shiny MCP Apps: `mcpConfigure(result = )` computes the result of the tool
+  that opens the app from the model's arguments, so the model (and hosts that
+  can't display apps) learns what the app shows instead of a fixed sentence.
+
+* Shiny MCP Apps: declared arguments named after inputs set those inputs
+  before the app's first render, so outputs are computed once, with the
+  model's values. The MCP bridge holds Shiny's initialization until the host
+  sends the tool's arguments (new `Shiny.deferInitialization()` in shiny.js),
+  and `update_<appId>_app` sets same-named inputs of a running instance.
+
+* `conditionalPanel()` works under Content Security Policies that don't
+  allow `'unsafe-eval'`, such as MCP Apps hosts': when the page refuses
+  `new Function()`, shiny.js reads the condition itself. It understands
+  comparisons, logic, arithmetic, `input.x`/`output.x`, `.length`, regular
+  expressions, and common string and array methods.
+
+* The MCP endpoint speaks protocol version 2025-11-25 and the stateless
+  2026-07-28 revision (`server/discover`, per-request `_meta`, mirrored
+  headers), and declares the MCP Apps extension in its capabilities. Under
+  2026-07-28, clients that can't display apps get neither the app's `_meta`
+  nor its internal tools.
+
 * Shiny MCP Apps configured with `mcpConfigure(arguments = ...)` now
   auto-register a companion `update_<appId>_app` tool. A model can call it to
   update an already-open app instance in place (via `mcpUpdates()`) instead of

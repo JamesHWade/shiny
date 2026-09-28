@@ -356,3 +356,32 @@ test_that("update_<appId>_app errors on unknown or missing session token", {
   expect_true(unknown$result$isError)
   expect_match(unknown$result$content[[1]]$text, "no-such-token", fixed = TRUE)
 })
+
+test_that("update_<appId>_app asks the page to set same-named inputs", {
+  skip_if_not_installed("ellmer")
+  withr::defer(.globals$mcp <- NULL)
+  mcpConfigure(appId = "demo", arguments = list(
+    n = ellmer::type_integer("count")
+  ))
+  token <- NULL
+  sess <- mcp_start_session(
+    fluidPage(numericInput("n", "N", 1)),
+    function(input, output, session) {
+      token <<- session$token
+    }
+  )
+  pump_shiny(0.2)
+  mcp_drain_frames(sess)
+
+  h <- mcpHttpHandler(function(req) NULL, sess$handlers$ws)
+  mcp_post(h, "tools/call", params = list(
+    name = "update_demo_app",
+    arguments = list(session = token, n = 7L)
+  ))
+  pump_shiny(0.3)
+  frames <- paste(mcp_drain_frames(sess), collapse = "\n")
+  expect_match(frames, "shiny.mcp.applyArguments", fixed = TRUE)
+  expect_match(frames, '"n":7', fixed = TRUE)
+
+  mcpTunnelToolCall("_shiny_close", list(connectionId = sess$cid), 9, sess$handlers$ws)
+})

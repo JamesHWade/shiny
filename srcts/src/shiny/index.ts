@@ -96,6 +96,9 @@ class ShinyClass {
   // Promise-like object that is resolved after initialization.
   initializedPromise: InitStatusPromise<void>;
 
+  // Promises initialization waits for; see deferInitialization().
+  private initializationDeferrals: Array<Promise<unknown>> = [];
+
   // Eventually deprecate
   // For old-style custom messages - should deprecate and migrate to new
   oncustommessage?: Handler;
@@ -140,6 +143,7 @@ class ShinyClass {
       // run first (i.e. to register bindings)
       setTimeout(async () => {
         try {
+          await Promise.allSettled(this.initializationDeferrals);
           await this.initialize();
         } catch (e) {
           showErrorInClientConsole(e);
@@ -147,6 +151,18 @@ class ShinyClass {
         }
       }, 1);
     });
+  }
+
+  /**
+   * Delays initialization until `promise` settles. For scripts that must
+   * change the page before Shiny reads its inputs: the MCP Apps bridge, for
+   * example, sets inputs from the arguments of the tool call that opened the
+   * app, which arrive from the host asynchronously. Call it before the
+   * document is ready.
+   * @param promise A promise; its result and any error are ignored.
+   */
+  deferInitialization(promise: Promise<unknown>): void {
+    this.initializationDeferrals.push(promise);
   }
 
   /**

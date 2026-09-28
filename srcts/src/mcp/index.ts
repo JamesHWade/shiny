@@ -16,7 +16,11 @@
 // 4. intercepts download-link clicks and delivers files as blob URLs;
 // 5. applies host theme/styles and forwards tool input/results into
 //    `session$clientData`;
-// 6. bridges `session$sendCustomMessage("shiny.mcp.updateModelContext", ...)`
+// 6. sets the inputs named by the tool's declared arguments: it holds Shiny's
+//    initialization until they arrive and writes them into the page, so the
+//    first render uses them (see applyArguments.ts); later ones are input
+//    changes;
+// 7. bridges `session$sendCustomMessage("shiny.mcp.updateModelContext", ...)`
 //    and `"shiny.mcp.sendMessage"` to the host.
 
 import type { McpUiHostContext } from "@modelcontextprotocol/ext-apps";
@@ -26,6 +30,16 @@ import {
   applyHostFonts,
   applyHostStyleVariables,
 } from "@modelcontextprotocol/ext-apps";
+import type {
+  FindTarget,
+  InputBindingLike,
+  InputValues,
+} from "./applyArguments";
+import {
+  applyAsUpdates,
+  applyToInitialInput,
+  applyToMarkup,
+} from "./applyArguments";
 import { McpHybridWebSocket } from "./hybridSocket";
 import type { ToolCaller } from "./tunnelSocket";
 import { McpTunnelWebSocket } from "./tunnelSocket";
@@ -33,12 +47,48 @@ import { createTunnelXhrClass } from "./tunnelXhr";
 
 type ShinyGlobal = {
   createSocket?: () => unknown;
+  deferInitialization?: (promise: Promise<unknown>) => void;
   setInputValue?: (name: string, value: unknown) => void;
   addCustomMessageHandler?: (
     type: string,
     handler: (message: unknown) => void,
   ) => void;
+  shinyapp?: {
+    $initialInput?: InputValues | null;
+    $inputValues?: InputValues;
+  };
 };
+
+type JQueryLike = {
+  (target: unknown): {
+    data(key: string): unknown;
+    on(event: string, handler: () => void): unknown;
+  };
+};
+
+function getJQuery(): JQueryLike | undefined {
+  return (window as unknown as { jQuery?: JQueryLike }).jQuery;
+}
+
+// The bound input with this id, and its binding.
+const findInputTarget: FindTarget = (id) => {
+  const el = document.getElementById(id);
+  const jq = getJQuery();
+  if (!el || !jq) return null;
+  const binding = jq(el).data("shiny-input-binding") as
+    | InputBindingLike
+    | undefined;
+  return binding ? { el, binding } : null;
+};
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// How long to wait, after the handshake, for the host to send the tool's
+// arguments before initializing Shiny without them; and at most in all.
+const toolInputWaitMs = 1000;
+const toolInputWaitCapMs = 4000;
 
 function getShiny(): ShinyGlobal | undefined {
   // eslint-disable-next-line @typescript-eslint/naming-convention
@@ -124,6 +174,9 @@ type ShinyMcpConfig = {
   appId?: string;
   directBase?: string;
   displayModes?: Array<"inline" | "fullscreen" | "pip">;
+  // Names of the arguments declared with mcpConfigure(arguments = ). Those
+  // named after inputs set them.
+  arguments?: string[];
 };
 
 function getConfig(): ShinyMcpConfig {
@@ -162,22 +215,53 @@ function initShinyMcpBridge(): void {
   );
 
   // Every tool input — the opening arguments AND any later ones — feeds the
-  // reactive mcpUpdates() channel. MCP hosts render a fresh app instance per
-  // tool call (there is no in-place "update" the model can reach), so "open"
-  // and "re-open" are the same event; the app applies args in a single
-  // mcpUpdates() observer. We deliberately do NOT use Shiny's RestoreContext
-  // here — see mcp/limitations.md for why widget auto-restore isn't reachable.
+  // reactive mcpUpdates() channel. Declared arguments named after inputs also
+  // set those inputs, in one of three ways depending on when they arrive:
+  //
+  // 1. Before Shiny initializes (the usual case: the bridge holds
+  //    initialization for them when the app declared arguments): written into
+  //    the inputs' markup, so Shiny's own bindings start from them.
+  // 2. After initialization, before the session starts: set through the
+  //    bindings and written into the values of Shiny's "init" message
+  //    (also the fallback for inputs whose markup isn't known).
+  // 3. Once the session runs: ordinary input changes.
   //
   // Register ontoolinput BEFORE connect() per ext-apps docs: one-shot events
   // may fire immediately after the handshake, so the handler must be in place
   // before connect() to avoid missing the notification.
-  app.ontoolinput = (params) => {
-    setShinyInput(
-      ".clientdata_mcp_tool_input",
-      JSON.stringify(params.arguments ?? {}),
-    );
-  };
+  const declared = config.arguments ?? [];
+  let beforeInit = true;
+  let sessionStarted = false;
+  // Arguments to put into Shiny's "init" message, and which of them to set
+  // through their bindings then.
+  let initArgs: InputValues | null = null;
+  let initByBinding: string[] = [];
+  let releaseInit!: () => void;
+  const initReleased = new Promise<void>((resolve) => {
+    releaseInit = () => {
+      beforeInit = false;
+      resolve();
+    };
+  });
 
+  app.ontoolinput = (params) => {
+    const args = (params.arguments ?? {}) as InputValues;
+    if (sessionStarted) {
+      setShinyInput(".clientdata_mcp_tool_input", JSON.stringify(args));
+      applyAsUpdates(args, declared, findInputTarget);
+      return;
+    }
+    initArgs = args;
+    if (beforeInit) {
+      const { unapplied } = applyToMarkup(args, declared, (id) =>
+        document.getElementById(id),
+      );
+      initByBinding = unapplied;
+      releaseInit();
+    } else {
+      initByBinding = [...declared];
+    }
+  };
   // Kick off the ui/initialize handshake immediately, but install
   // createSocket synchronously: Shiny's DOM-ready init may run before the
   // handshake completes, and tool calls must wait for connect() anyway.
@@ -231,6 +315,38 @@ function initShinyMcpBridge(): void {
   let resolveConnection!: (id: string) => void;
   const connectionId = new Promise<string>((resolve) => {
     resolveConnection = resolve;
+  });
+
+  // Hosts send the tool's arguments right after the handshake. When the app
+  // declared arguments, hold Shiny's initialization briefly for them.
+  if (declared.length > 0 && shiny.deferInitialization) {
+    void connected.then(
+      () => delay(toolInputWaitMs).then(releaseInit),
+      releaseInit,
+    );
+    void delay(toolInputWaitCapMs).then(releaseInit);
+    shiny.deferInitialization(initReleased);
+  } else {
+    releaseInit();
+  }
+
+  // `shiny:connected` fires just before Shiny sends "init" with
+  // `shinyapp.$initialInput`: the arguments' values reach the server
+  // function's first render.
+  getJQuery()?.(document).on("shiny:connected", () => {
+    if (sessionStarted) return;
+    sessionStarted = true;
+    const shinyapp = getShiny()?.shinyapp;
+    const initial = shinyapp?.$initialInput;
+    if (!initArgs || !shinyapp || !initial) return;
+    initial[".clientdata_mcp_tool_input"] = JSON.stringify(initArgs);
+    applyToInitialInput(
+      initArgs,
+      initByBinding,
+      findInputTarget,
+      initial,
+      shinyapp.$inputValues ?? {},
+    );
   });
 
   shiny.createSocket = () => {
@@ -322,6 +438,10 @@ function initShinyMcpBridge(): void {
             console.warn("shiny-mcp-bridge: sendMessage failed:", err),
           ),
       );
+    });
+    // update_<appId>_app: the model changed arguments of a running instance.
+    s.addCustomMessageHandler("shiny.mcp.applyArguments", (message) => {
+      applyAsUpdates(message as InputValues, declared, findInputTarget);
     });
     s.addCustomMessageHandler("shiny.mcp.requestDisplayMode", (message) => {
       void connected.then(() =>

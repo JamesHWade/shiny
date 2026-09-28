@@ -8,7 +8,18 @@
 # tunneled over postMessage -> tools/call (see mcp-tunnel.R and
 # srcts/src/mcp/).
 
-MCP_PROTOCOL_VERSIONS <- c("2024-11-05", "2025-03-26", "2025-06-18")
+# Protocol versions that open with an `initialize` handshake.
+MCP_PROTOCOL_VERSIONS <- c("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25")
+# The 2026-07-28 revision has no handshake and no sessions: every request
+# carries its protocol version and the client's capabilities in
+# `params$_meta`, so any server process can answer it. `server/discover`
+# advertises what the server supports.
+MCP_STATELESS_VERSIONS <- c("2026-07-28")
+MCP_META_PROTOCOL_VERSION <- "io.modelcontextprotocol/protocolVersion"
+MCP_META_CLIENT_CAPABILITIES <- "io.modelcontextprotocol/clientCapabilities"
+MCP_META_SERVER_INFO <- "io.modelcontextprotocol/serverInfo"
+# Clients and servers declare MCP Apps support under this extension id.
+MCP_UI_EXTENSION <- "io.modelcontextprotocol/ui"
 MCP_RESOURCE_URI <- "ui://shiny/app"
 MCP_RESOURCE_MIME <- "text/html;profile=mcp-app"
 
@@ -241,7 +252,7 @@ mcpCorsHeaders <- function() {
     "Access-Control-Allow-Methods" = "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers" = paste(
       "Content-Type, Authorization, Mcp-Session-Id, Mcp-Protocol-Version,",
-      "Last-Event-Id"
+      "Mcp-Method, Mcp-Name, Last-Event-Id"
     )
   )
 }
@@ -316,8 +327,97 @@ mcpHttpHandler <- function(uiHandler, wsHandler) {
         headers = mcpCorsHeaders()
       ))
     }
-    hybrid_chain(out, mcpJsonResponse)
+    hybrid_chain(out, function(payload) {
+      status <- attr(payload, "mcpHttpStatus", exact = TRUE) %||% 200L
+      attr(payload, "mcpHttpStatus") <- NULL
+      mcpJsonResponse(payload, status)
+    })
   }
+}
+
+# An error response that the HTTP transport sends with `status`.
+mcpHttpError <- function(id, code, message, status, data = NULL) {
+  error <- dropNulls(list(code = code, message = message, data = data))
+  structure(
+    list(jsonrpc = "2.0", id = id, error = error),
+    mcpHttpStatus = status
+  )
+}
+
+# The protocol version a stateless (2026-07-28) request names in its `_meta`,
+# or NULL for a request from the handshake era.
+mcpStatelessVersion <- function(body) {
+  version <- body$params$`_meta`[[MCP_META_PROTOCOL_VERSION]]
+  if (is.null(version) || identical(body$method, "initialize")) {
+    return(NULL)
+  }
+  version
+}
+
+mcpRequestHeader <- function(req, name) {
+  if (is.null(req)) {
+    return(NULL)
+  }
+  key <- paste0("HTTP_", gsub("-", "_", toupper(name), fixed = TRUE))
+  value <- tryCatch(req[[key]], error = function(e) NULL)
+  if (is.character(value) && length(value) == 1) value else NULL
+}
+
+# Header values may carry non-ASCII text as `=?base64?<data>?=`.
+mcpDecodeHeader <- function(value) {
+  if (startsWith(value, "=?base64?") && endsWith(value, "?=")) {
+    encoded <- substr(value, 10, nchar(value) - 2)
+    decoded <- tryCatch(
+      rawToChar(jsonlite::base64_dec(encoded)),
+      error = function(e) NULL
+    )
+    if (!is.null(decoded)) Encoding(decoded) <- "UTF-8"
+    return(decoded)
+  }
+  value
+}
+
+# Over HTTP, a stateless request mirrors its version, method, and target in
+# headers. Returns NULL when they agree with the body, else the problem.
+mcpStatelessHeaderProblem <- function(body, version, req) {
+  headerVersion <- mcpRequestHeader(req, "MCP-Protocol-Version")
+  if (is.null(headerVersion)) {
+    return("Header mismatch: MCP-Protocol-Version header is required.")
+  }
+  if (!identical(headerVersion, version)) {
+    return(sprintf(
+      "Header mismatch: MCP-Protocol-Version header '%s' does not match body value '%s'.",
+      headerVersion, version
+    ))
+  }
+  if (is.null(body$id)) {
+    return(NULL)
+  }
+  headerMethod <- mcpRequestHeader(req, "Mcp-Method")
+  if (!identical(headerMethod, body$method)) {
+    return(sprintf(
+      "Header mismatch: Mcp-Method header '%s' does not match body value '%s'.",
+      headerMethod %||% "", body$method
+    ))
+  }
+  target <- switch(body$method,
+    "tools/call" = ,
+    "prompts/get" = body$params$name,
+    "resources/read" = body$params$uri,
+    NULL
+  )
+  if (is.null(target)) {
+    return(NULL)
+  }
+  headerName <- mcpRequestHeader(req, "Mcp-Name")
+  decoded <- if (!is.null(headerName)) mcpDecodeHeader(headerName)
+  if (!identical(decoded, target)) {
+    return(sprintf(
+      "Header mismatch: Mcp-Name header '%s' does not match body value '%s'.",
+      decoded %||% headerName %||% "", target
+    ))
+  }
+  NULL
 }
 
 mcpDispatch <- function(body, uiHandler, wsHandler, req = NULL) {
@@ -325,18 +425,117 @@ mcpDispatch <- function(body, uiHandler, wsHandler, req = NULL) {
   if (!is.character(method) || length(method) != 1) {
     return(mcpError(body$id, -32600L, "Invalid Request"))
   }
+
+  stateless <- mcpStatelessVersion(body)
+  if (!is.null(stateless)) {
+    return(mcpStatelessDispatch(body, stateless, uiHandler, wsHandler, req))
+  }
   if (grepl("^notifications/", method)) {
     return(NULL)
   }
+  # A handshake-era client names its version in a header over HTTP.
+  headerVersion <- mcpRequestHeader(req, "MCP-Protocol-Version")
+  if (
+    !is.null(headerVersion) &&
+      !headerVersion %in% c(MCP_PROTOCOL_VERSIONS, MCP_STATELESS_VERSIONS)
+  ) {
+    return(mcpHttpError(
+      body$id, -32600L,
+      paste("Unsupported MCP-Protocol-Version:", headerVersion),
+      400L
+    ))
+  }
+  mcpDispatchMethod(body, uiHandler, wsHandler, req)
+}
 
-  switch(method,
+mcpDispatchMethod <- function(body, uiHandler, wsHandler, req = NULL,
+                              clientCapabilities = NULL) {
+  switch(body$method,
     "initialize" = mcpResult(body$id, mcpInitializeResult(body)),
+    "server/discover" = mcpResult(body$id, mcpDiscoverResult()),
     "ping" = mcpResult(body$id, empty_named_list()),
-    "tools/list" = mcpResult(body$id, list(tools = mcpToolsList())),
+    "tools/list" = mcpResult(
+      body$id,
+      list(tools = mcpToolsList(clientCapabilities))
+    ),
     "tools/call" = mcpToolCall(body, uiHandler, wsHandler),
     "resources/list" = mcpResult(body$id, list(resources = mcpResourcesList())),
     "resources/read" = mcpResourcesRead(body, uiHandler, req),
     mcpError(body$id, -32601L, "Method not found")
+  )
+}
+
+# Serve a 2026-07-28 request: check its version (and, over HTTP, the headers
+# that mirror it), answer it without session state, and mark the result
+# complete with the server's identity.
+mcpStatelessDispatch <- function(body, version, uiHandler, wsHandler, req) {
+  isNotification <- is.null(body$id)
+  if (!version %in% MCP_STATELESS_VERSIONS) {
+    if (isNotification) return(NULL)
+    return(mcpHttpError(
+      body$id, -32022L, "Unsupported protocol version", 400L,
+      data = list(
+        supported = as.list(c(MCP_STATELESS_VERSIONS, MCP_PROTOCOL_VERSIONS)),
+        requested = version
+      )
+    ))
+  }
+  if (!is.null(req)) {
+    problem <- mcpStatelessHeaderProblem(body, version, req)
+    if (!is.null(problem)) {
+      if (isNotification) return(NULL)
+      return(mcpHttpError(body$id, -32020L, problem, 400L))
+    }
+  }
+  if (isNotification) {
+    return(NULL)
+  }
+  capabilities <- body$params$`_meta`[[MCP_META_CLIENT_CAPABILITIES]]
+  out <- mcpDispatchMethod(
+    body, uiHandler, wsHandler, req,
+    clientCapabilities = if (is.list(capabilities)) capabilities else list()
+  )
+  hybrid_chain(out, function(response) {
+    if (!is.null(response$error)) {
+      if (identical(response$error$code, -32601L)) {
+        attr(response, "mcpHttpStatus") <- 404L
+      }
+      return(response)
+    }
+    result <- response$result
+    result$resultType <- result$resultType %||% "complete"
+    meta <- result$`_meta` %||% list()
+    meta[[MCP_META_SERVER_INFO]] <- mcpServerInfo()
+    result$`_meta` <- meta
+    ttl <- switch(body$method,
+      "tools/list" = ,
+      "resources/list" = 60000,
+      "resources/read" = 0,
+      NULL
+    )
+    if (!is.null(ttl)) {
+      result$ttlMs <- ttl
+      result$cacheScope <- "private"
+    }
+    response$result <- result
+    response
+  })
+}
+
+mcpServerInfo <- function() {
+  list(
+    name = "shiny",
+    version = as.character(get_package_version("shiny"))
+  )
+}
+
+mcpServerCapabilities <- function() {
+  extensions <- list()
+  extensions[[MCP_UI_EXTENSION]] <- empty_named_list()
+  list(
+    tools = list(listChanged = FALSE),
+    resources = list(subscribe = FALSE, listChanged = FALSE),
+    extensions = extensions
   )
 }
 
@@ -349,18 +548,37 @@ mcpInitializeResult <- function(body) {
   }
   list(
     protocolVersion = version,
-    capabilities = list(
-      tools = list(listChanged = FALSE),
-      resources = list(subscribe = FALSE, listChanged = FALSE)
-    ),
-    serverInfo = list(
-      name = "shiny",
-      version = as.character(get_package_version("shiny"))
-    )
+    capabilities = mcpServerCapabilities(),
+    serverInfo = mcpServerInfo()
   )
 }
 
-mcpToolsList <- function() {
+mcpDiscoverResult <- function() {
+  list(
+    supportedVersions = as.list(c(MCP_STATELESS_VERSIONS, MCP_PROTOCOL_VERSIONS)),
+    capabilities = mcpServerCapabilities(),
+    serverInfo = mcpServerInfo(),
+    ttlMs = 60000,
+    cacheScope = "public"
+  )
+}
+
+# Does a client's capabilities object declare MCP Apps support? NULL (a
+# handshake-era request, whose capabilities aren't kept) counts as yes.
+mcpClientSupportsUi <- function(capabilities) {
+  if (is.null(capabilities)) {
+    return(TRUE)
+  }
+  ui <- capabilities$extensions[[MCP_UI_EXTENSION]]
+  if (is.null(ui)) {
+    return(FALSE)
+  }
+  mimeTypes <- if (is.list(ui)) ui$mimeTypes
+  is.null(mimeTypes) || MCP_RESOURCE_MIME %in% unlist(mimeTypes)
+}
+
+mcpToolsList <- function(clientCapabilities = NULL) {
+  ui <- mcpClientSupportsUi(clientCapabilities)
   info <- mcpToolInfo()
   update_entry <- if (mcpHasUpdateTool()) {
     upd <- mcpUpdateToolInfo()
@@ -373,16 +591,17 @@ mcpToolsList <- function() {
     list()
   }
   # unname: a partially named list would serialize as a JSON object rather
-  # than the array that tools/list requires.
+  # than the array that tools/list requires. Clients that can't show apps
+  # get neither the app's `_meta` nor the tools only its page may call.
   unname(c(
-    list(list(
+    list(dropNulls(list(
       name = info$name,
       description = info$description,
       inputSchema = info$inputSchema,
-      `_meta` = list(ui = list(resourceUri = mcpResourceUri()))
-    )),
+      `_meta` = if (ui) list(ui = list(resourceUri = mcpResourceUri()))
+    ))),
     update_entry,
-    mcpTunnelToolsList(),
+    if (ui) mcpTunnelToolsList(),
     lapply(mcpAuthorTools(), function(tool) {
       dropNulls(list(
         name = S7::prop(tool, "name"),
@@ -497,6 +716,10 @@ mcpUpdateAppCall <- function(params, id) {
   withReactiveDomain(session, {
     rv <- mcpServerUpdatesFor(session)
     rv(utils::modifyList(isolate(rv()) %||% list(), pushed))
+    # Arguments named after inputs set those inputs, as when the app opened.
+    if (length(pushed) > 0) {
+      session$sendCustomMessage("shiny.mcp.applyArguments", pushed)
+    }
   })
   session$requestFlush()
   mcpResult(id, list(content = list(list(
@@ -505,16 +728,47 @@ mcpUpdateAppCall <- function(params, id) {
   ))))
 }
 
+MCP_OPEN_TEXT <- "The Shiny app is now displayed in the conversation."
+
+# The result of the tool that opens the app: the default text, or what the
+# app's `mcpConfigure(result = )` function makes of the model's arguments.
+mcpOpenAppCall <- function(params, id) {
+  default <- mcpResult(id, list(
+    content = list(list(type = "text", text = MCP_OPEN_TEXT))
+  ))
+  resultFn <- .globals$mcp$result
+  if (!is.function(resultFn)) {
+    return(default)
+  }
+  args <- mcpFilterArguments(params$arguments %||% list()) %||% list()
+  fallback <- function(e) {
+    warning(
+      "mcpConfigure(result = ) failed; the model gets the default text: ",
+      conditionMessage(e),
+      call. = FALSE
+    )
+    default
+  }
+  hybrid_chain(
+    tryCatch(resultFn(args), error = function(e) e),
+    function(value) {
+      if (inherits(value, "condition")) {
+        return(fallback(value))
+      }
+      if (is.null(value)) {
+        return(default)
+      }
+      mcpAuthorToolResult(id, value)
+    },
+    catch = fallback
+  )
+}
+
 mcpToolCall <- function(body, uiHandler, wsHandler) {
   name <- body$params$name %||% ""
   info <- mcpToolInfo()
   if (identical(name, info$name)) {
-    return(mcpResult(body$id, list(
-      content = list(list(
-        type = "text",
-        text = "The Shiny app is now displayed in the conversation."
-      ))
-    )))
+    return(mcpOpenAppCall(body$params, body$id))
   }
   if (mcpHasUpdateTool() && identical(name, mcpUpdateToolName())) {
     return(mcpUpdateAppCall(body$params, body$id))
@@ -555,7 +809,11 @@ mcpResourcesRead <- function(body, uiHandler, req = NULL) {
   config <- dropNulls(list(
     appId = mcpAppId(),
     directBase = base,
-    displayModes = as.list(mcpDisplayModes())
+    displayModes = as.list(mcpDisplayModes()),
+    # Declared arguments named after inputs set those inputs.
+    arguments = if (length(.globals$mcp$arguments) > 0) {
+      as.list(names(.globals$mcp$arguments))
+    }
   ))
 
   ui_meta <- list(prefersBorder = TRUE)
