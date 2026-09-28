@@ -2,7 +2,7 @@
 // relative requests are tunneled through the app-only `_shiny_http` tool
 // (postMessage -> host -> MCP server -> in-process Shiny handlers). This
 // covers every HTTP side channel in the Shiny client without touching
-// shiny.js itself: jQuery.ajax (file upload POSTs, DataTables/selectize
+// shiny.js itself: jQuery ajax (file upload POSTs, DataTables/selectize
 // requests) creates its XHR via `new window.XMLHttpRequest()` per request,
 // and render.ts's restyle fetch uses raw XHR.
 //
